@@ -1,0 +1,22 @@
+[project]
+name = "context-aware-search"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "einops>=0.8.2",
+    "faiss-cpu>=1.13.2",
+    "fastapi>=0.135.3",
+    "ipykernel>=7.2.0",
+    "matplotlib>=3.10.8",
+    "matplotlib-inline>=0.2.1",
+    "moondream>=1.1.0",
+    "numpy>=2.4.4",
+    "pillow>=10.4.0",
+    "sentence-transformers>=5.4.0",
+    "torch>=2.10.0",
+    "torchvision>=0.25.0",
+    "transformers>=5.5.3",
+    "uvicorn>=0.44.0",
+]
