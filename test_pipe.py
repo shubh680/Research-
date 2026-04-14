@@ -3,15 +3,17 @@ import faiss
 import torch
 import numpy as np
 from PIL import Image
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, CLIPProcessor, CLIPModel
+from transformers import (
+    CLIPProcessor, CLIPModel,
+    LlavaForConditionalGeneration, AutoProcessor
+)
 from sentence_transformers import SentenceTransformer, util
 
 # --- CONFIGURATION ---
-# Use raw strings (r"") to prevent Windows path errors
 TEST_GALLERY = [
-    r"img\apple1.jpg", 
-    r"img\apple2.jpg", 
-    r"img\apple3.jpg", 
+    r"img\apple1.jpg",
+    r"img\apple2.jpg",
+    r"img\apple3.jpg",
     r"img\apple4.jpg"
 ]
 QUERY_IMAGE = r"img\query_apple.jpg"
@@ -19,70 +21,124 @@ ALPHA = 0.4  # Weight: 40% Visual, 60% Semantic
 
 def main():
     print("--- [INIT] Initializing Research Pipeline ---")
-    
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"--- [INFO] Using device: {device}")
-    
-    # 1. Initialize Stage 1: CLIP
+
+    # ------------------------------------------------------------------ #
+    # STAGE 1: CLIP — visual embedding + FAISS retrieval (unchanged)
+    # ------------------------------------------------------------------ #
     print("--- [INIT] Loading CLIP (Stage 1)...")
     clip_id = "openai/clip-vit-base-patch32"
     clip_model = CLIPModel.from_pretrained(clip_id).to(device)
     clip_processor = CLIPProcessor.from_pretrained(clip_id)
-    
-    # 2. Initialize Stage 2: Moondream (WITH PHICONFIG FIX)
-    print("--- [INIT] Loading Moondream VLM (Stage 2)...")
-    vlm_id = "vikhyatk/moondream2"
-    vlm_revision = "2024-08-26" # Using a stable recent revision
-    
-    # FIX: Load tokenizer and config separately to patch the missing pad_token_id
-    vlm_tokenizer = AutoTokenizer.from_pretrained(vlm_id, revision=vlm_revision)
-    vlm_config = AutoConfig.from_pretrained(vlm_id, trust_remote_code=True, revision=vlm_revision)
-    
-    # Explicitly set the pad_token_id to avoid the AttributeError in Phi modeling
-    if not hasattr(vlm_config, "pad_token_id") or vlm_config.pad_token_id is None:
-        vlm_config.pad_token_id = vlm_tokenizer.eos_token_id
-    
-    vlm_model = AutoModelForCausalLM.from_pretrained(
-        vlm_id, 
-        config=vlm_config,
-        trust_remote_code=True, 
-        revision=vlm_revision,
-        torch_dtype=torch.float32 if device == "cpu" else torch.float16
-    ).to(device)
+
+    # ------------------------------------------------------------------ #
+    # STAGE 2: LLaVA-1.5-7B — replaces Moondream
+    #   - Actively maintained under huggingface/transformers directly
+    #   - No trust_remote_code, no revision pinning, no cache patching
+    #   - Same interface: image -> caption string
+    #   - Uses 4-bit quantization on GPU to keep VRAM under 8GB,
+    #     falls back to float32 on CPU (slow but works)
+    # ------------------------------------------------------------------ #
+    print("--- [INIT] Loading LLaVA-1.5 VLM (Stage 2)...")
+    vlm_id = "llava-hf/llava-1.5-7b-hf"
+
+    if device == "cuda":
+        from transformers import BitsAndBytesConfig
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4"
+        )
+        vlm_model = LlavaForConditionalGeneration.from_pretrained(
+            vlm_id,
+            quantization_config=bnb_config,
+            device_map="auto"
+        )
+    else:
+        # CPU: no quantization, load in float32
+        vlm_model = LlavaForConditionalGeneration.from_pretrained(
+            vlm_id,
+            torch_dtype=torch.float32,
+            device_map="cpu"
+        )
+
+    vlm_processor = AutoProcessor.from_pretrained(vlm_id)
     vlm_model.eval()
-    
-    # 3. Initialize Stage 3: SBERT
+
+    # ------------------------------------------------------------------ #
+    # STAGE 3: SBERT — semantic scoring (unchanged)
+    # ------------------------------------------------------------------ #
     print("--- [INIT] Loading SBERT (Stage 3)...")
     text_model = SentenceTransformer('all-MiniLM-L6-v2')
-    
-    # 4. Infrastructure (FAISS)
+
+    # ------------------------------------------------------------------ #
+    # FAISS index (unchanged)
+    # ------------------------------------------------------------------ #
     index = faiss.IndexFlatL2(512)
     image_paths = []
 
     def get_clip_features(path):
-        """Extracts features and handles potential wrapper object errors."""
-        img = Image.open(path)
+        img = Image.open(path).convert("RGB")
         inputs = clip_processor(images=img, return_tensors="pt").to(device)
         with torch.no_grad():
             outputs = clip_model.get_image_features(**inputs)
-            # Handle BaseOutput wrappers
             tensor = outputs.pooler_output if hasattr(outputs, "pooler_output") else outputs
         return tensor.cpu().numpy()
 
-    # --- EXECUTION: INDEXING ---
+    def get_vlm_caption(img_path):
+        """
+        LLaVA-1.5 captioning. Uses the chat-style prompt format it was trained on.
+        Returns a plain string caption.
+        """
+        image = Image.open(img_path).convert("RGB")
+        prompt = "USER: <image>\nDescribe this object and its setting briefly.\nASSISTANT:"
+        inputs = vlm_processor(
+            text=prompt,
+            images=image,
+            return_tensors="pt"
+        ).to(vlm_model.device)
+
+        with torch.no_grad():
+            output_ids = vlm_model.generate(
+                **inputs,
+                max_new_tokens=64,
+                do_sample=False
+            )
+
+        # Decode only the newly generated tokens (skip the prompt)
+        generated = output_ids[0][inputs["input_ids"].shape[-1]:]
+        caption = vlm_processor.decode(generated, skip_special_tokens=True).strip()
+        return caption
+
+    # ------------------------------------------------------------------ #
+    # INDEXING
+    # ------------------------------------------------------------------ #
     print(f"\n--- [INDEX] Processing {len(TEST_GALLERY)} items ---")
     for path in TEST_GALLERY:
         if not os.path.exists(path):
-            print(f" Skipping: {path} (Not Found)")
+            print(f"  Skipping: {path} (Not Found)")
             continue
         emb = get_clip_features(path)
         faiss.normalize_L2(emb)
         index.add(emb)
         image_paths.append(path)
-        print(f"Indexed: {os.path.basename(path)}")
+        print(f"  Indexed: {os.path.basename(path)}")
 
-    # --- EXECUTION: STAGE 1 (VISUAL) ---
+    if len(image_paths) == 0:
+        print("FATAL: No images indexed. Check your img\\ paths.")
+        return
+
+    # ------------------------------------------------------------------ #
+    # STAGE 1 — VISUAL SEARCH
+    # ------------------------------------------------------------------ #
     print(f"\n--- [STAGE 1] Searching for: {os.path.basename(QUERY_IMAGE)} ---")
+    if not os.path.exists(QUERY_IMAGE):
+        print(f"FATAL: Query image not found: {QUERY_IMAGE}")
+        return
+
     q_emb = get_clip_features(QUERY_IMAGE)
     faiss.normalize_L2(q_emb)
     distances, indices = index.search(q_emb, len(image_paths))
@@ -95,29 +151,23 @@ def main():
             'rank': rank + 1
         })
 
-    # --- EXECUTION: STAGE 2 (SEMANTIC REFINEMENT) ---
+    # ------------------------------------------------------------------ #
+    # STAGE 2 — SEMANTIC REFINEMENT
+    # ------------------------------------------------------------------ #
     print("--- [STAGE 2] Performing Semantic Refinement...")
-    
-    def get_vlm_context(img_path):
-        image = Image.open(img_path)
-        # Moondream internal method for captioning
-        enc_image = vlm_model.encode_image(image)
-        caption = vlm_model.answer_question(enc_image, "Describe this object and its setting briefly.", vlm_tokenizer)
-        return caption
 
-    q_ctx_text = get_vlm_context(QUERY_IMAGE)
-    print(f"   [Query Context]: {q_ctx_text}")
+    q_ctx_text = get_vlm_caption(QUERY_IMAGE)
+    print(f"  [Query Context]: {q_ctx_text}")
+
+    # Encode query caption once
+    q_text_emb = text_model.encode(q_ctx_text, convert_to_tensor=True)
 
     final_results = []
     for match in initial_matches:
-        m_ctx_text = get_vlm_context(match['path'])
-        
-        # Compute Semantic Consistency via SBERT
-        q_text_emb = text_model.encode(q_ctx_text, convert_to_tensor=True)
+        m_ctx_text = get_vlm_caption(match['path'])
         m_text_emb = text_model.encode(m_ctx_text, convert_to_tensor=True)
         semantic_score = util.cos_sim(q_text_emb, m_text_emb).item()
 
-        # Weighted Score Fusion
         final_score = (ALPHA * match['visual_score']) + ((1 - ALPHA) * semantic_score)
 
         final_results.append({
@@ -127,17 +177,18 @@ def main():
             "caption": m_ctx_text
         })
 
-    # Re-rank based on the fused score
     final_results = sorted(final_results, key=lambda x: x['final_score'], reverse=True)
 
-    # --- TERMINAL LOGGING ---
-    print("\n" + "="*95)
+    # ------------------------------------------------------------------ #
+    # RESULTS
+    # ------------------------------------------------------------------ #
+    print("\n" + "=" * 95)
     print(f"{'FILENAME':<20} | {'OLD RANK':<10} | {'NEW RANK':<10} | {'SCORE':<10} | {'CONTEXTUAL IDENTITY'}")
     print("-" * 95)
     for i, res in enumerate(final_results):
         fname = os.path.basename(res['path'])
-        print(f"{fname:<20} | {res['old_rank']:<10} | {i+1:<10} | {res['final_score']:.4f} | {res['caption']}")
-    print("="*95 + "\n")
+        print(f"{fname:<20} | {res['old_rank']:<10} | {i+1:<10} | {res['final_score']:.4f}     | {res['caption']}")
+    print("=" * 95 + "\n")
 
 if __name__ == "__main__":
     try:
