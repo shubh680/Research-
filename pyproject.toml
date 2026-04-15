@@ -13,6 +13,7 @@ dependencies = [
     "matplotlib-inline>=0.2.1",
     "moondream>=1.1.0",
     "numpy>=2.4.4",
+    "ollama>=0.6.1",
     "pillow>=10.4.0",
     "sentence-transformers>=5.4.0",
     "torch>=2.10.0",
